@@ -3,7 +3,12 @@
 // @namespace    local.haijiao.unlock
 // @version      1.0.2
 // @description  用 CDN 上同目录的完整 m3u8 替换试看 m3u8（API 只下发 30 秒试看列表，完整列表未鉴权）；顺手清掉广告位。不改 cookie、不改 DOM 付费状态、不发任何第三方请求。
-// @author       local
+// @author       zhaoruizhe81
+// @homepageURL  https://github.com/zhaoruizhe81/haijiao-unlock
+// @supportURL   https://github.com/zhaoruizhe81/haijiao-unlock/issues
+// @downloadURL  https://raw.githubusercontent.com/zhaoruizhe81/haijiao-unlock/main/haijiao-unlock.user.js
+// @updateURL    https://raw.githubusercontent.com/zhaoruizhe81/haijiao-unlock/main/haijiao-unlock.user.js
+// @license      MIT
 // @match        https://haijiao.com/*
 // @match        https://www.haijiao.com/*
 // @match        https://haijiao2023.com/*
