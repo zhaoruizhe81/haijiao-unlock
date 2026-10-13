@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         海角社区 · 付费视频解锁(CDN完整播放列表) + 去广告
 // @namespace    local.haijiao.unlock
-// @version      1.2.0
+// @version      1.2.1
 // @description  用 CDN 上同目录的完整 m3u8 替换试看 m3u8（API 只下发 30 秒试看列表，完整列表未鉴权）；一键下载并解密，可直接产出 MP4；顺手清掉广告位。不改 cookie、不改 DOM 付费状态、不发任何第三方请求。
 // @author       zhaoruizhe81
 // @homepageURL  https://github.com/zhaoruizhe81/haijiao-unlock
@@ -679,15 +679,51 @@
     return t || fallback;
   }
 
-  /** 同步取一个像标题的东西（要赶在 showSaveFilePicker 之前，不能 await）。 */
-  function quickTitle() {
-    const cands = ['h1', '.post-title', '.title', '[class*="title"]'];
-    for (const sel of cands) {
-      const el = document.querySelector(sel);
-      const t = el && sanitizeName(el.textContent, '');
-      if (t && t.length > 2 && !/^海角社区$/.test(t)) return t;
+  /**
+   * 这个元素是不是**真的渲染出来了**。
+   *
+   * 坑在这：隐藏元素（站点的各种 Element-UI 弹窗）的 textContent 照样能读到，
+   * 所以"有文字"完全不能作为"这是页面上的标题"的依据。必须逐级往上确认祖先
+   * 都没有 display:none / visibility:hidden，并且自己有非零尺寸。
+   */
+  function isRendered(el) {
+    if (!el || !el.isConnected) return false;
+    for (let n = el; n instanceof Element; n = n.parentElement) {
+      const cs = getComputedStyle(n);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity) === 0) return false;
     }
-    return 'haijiao';
+    const r = el.getBoundingClientRect();
+    return r.width >= 8 && r.height >= 8;
+  }
+
+  // 站点的 UI 文案。只有翻到隐藏弹窗时才读得到它们，出现即判为误命中。
+  const TITLE_REJECT = /(请选择|正在移动|我的置顶|举报|确认|取消|提示|线路|点击购买|出售内容|预览|海角社区|^[\d\s.·-]+$)/;
+
+  /**
+   * 同步取一个像标题的东西（要赶在 showSaveFilePicker 之前，不能 await）。
+   *
+   * 顺序是"越像标题越靠前"：h2 是这个站放正文标题的地方；h1 常常只是个空的
+   * 图标容器（textContent 为空，会被下面的长度检查自然跳过）；泛匹配
+   * [class*="title"] 放最后兜底，它最容易撞上隐藏弹窗。
+   */
+  function quickTitle() {
+    const sels = ['h2', 'h1', 'h3', '[class*="post-title"]', '[class*="article-title"]',
+      '[class*="detail-title"]', '[class*="title"]'];
+    const seen = new Set();
+    for (const sel of sels) {
+      for (const el of document.querySelectorAll(sel)) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+        if (!isRendered(el)) continue;
+        const t = sanitizeName(el.textContent, '');
+        if (t.length < 4 || t.length > 90) continue;
+        if (TITLE_REJECT.test(t)) continue;
+        return t;
+      }
+    }
+    // 退一步：<title> 去掉站点后缀
+    const dt = sanitizeName(document.title, '').replace(/[-|·]\s*海角社区.*$/, '').trim();
+    return dt && dt !== '海角社区' && !TITLE_REJECT.test(dt) ? dt : 'haijiao';
   }
 
   let downloadBusy = false;
@@ -887,7 +923,7 @@
     setupNotices();
     hookHls();
     floatingActions();
-    LOG('已加载 · 油猴脚本 v1.2.0');
+    LOG('已加载 · 油猴脚本 v1.2.1');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
