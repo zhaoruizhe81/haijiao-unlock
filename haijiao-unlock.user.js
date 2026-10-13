@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         海角社区 · 付费视频解锁(CDN完整播放列表) + 去广告
 // @namespace    local.haijiao.unlock
-// @version      1.1.0
-// @description  用 CDN 上同目录的完整 m3u8 替换试看 m3u8（API 只下发 30 秒试看列表，完整列表未鉴权）；一键下载并解密成可离线播放的视频；顺手清掉广告位。不改 cookie、不改 DOM 付费状态、不发任何第三方请求。
+// @version      1.2.0
+// @description  用 CDN 上同目录的完整 m3u8 替换试看 m3u8（API 只下发 30 秒试看列表，完整列表未鉴权）；一键下载并解密，可直接产出 MP4；顺手清掉广告位。不改 cookie、不改 DOM 付费状态、不发任何第三方请求。
 // @author       zhaoruizhe81
 // @homepageURL  https://github.com/zhaoruizhe81/haijiao-unlock
 // @supportURL   https://github.com/zhaoruizhe81/haijiao-unlock/issues
@@ -13,6 +13,7 @@
 // @match        https://www.haijiao.com/*
 // @match        https://haijiao2023.com/*
 // @match        https://www.haijiao2023.com/*
+// @require      https://cdn.jsdelivr.net/npm/mux.js@7/dist/mux.min.js
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
@@ -405,7 +406,10 @@
         playFullHere(hit.url);
       })
     );
-    if (CFG.download) box.append(mk('⬇ 下载视频', downloadVideo));
+    if (CFG.download) {
+      box.append(mk('⬇ 下载 MP4', () => downloadVideo('mp4')));
+      box.append(mk('⬇ 下载 TS(原始)', () => downloadVideo('ts')));
+    }
     (document.body || document.documentElement).appendChild(box);
   }
 
@@ -689,19 +693,61 @@
   let downloadBusy = false;
   let downloadCancelled = false;
 
-  async function downloadVideo() {
+  const MUXJS_CDNS = [
+    'https://cdn.jsdelivr.net/npm/mux.js@7/dist/mux.min.js',
+    'https://unpkg.com/mux.js@7/dist/mux.min.js',
+  ];
+
+  /**
+   * 确保 TS→fMP4 的重封装器可用。
+   * 正常情况下 @require 早就把它加载好了，这里只是一次同步确认；只有它没生效时
+   * （CDN 被挡、装的是旧版本脚本）才会真的去网络上补一次。
+   */
+  async function ensureMuxjs() {
+    const ready = () => !!(window.muxjs && window.muxjs.mp4 && window.muxjs.mp4.Transmuxer);
+    if (ready()) return true;
+    for (const url of MUXJS_CDNS) {
+      try {
+        await new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = url;
+          s.onload = resolve;
+          s.onerror = () => reject(new Error('load failed'));
+          (document.head || document.documentElement).appendChild(s);
+        });
+        if (ready()) { LOG('重封装器已补加载:', url); return true; }
+      } catch (e) { WARN('重封装器加载失败', url); }
+    }
+    return false;
+  }
+
+  const FORMAT_INFO = {
+    ts: { ext: 'ts', mime: 'video/mp2t', label: 'TS 原始' },
+    mp4: { ext: 'mp4', mime: 'video/mp4', label: 'MP4' },
+  };
+
+  async function downloadVideo(format) {
     if (downloadBusy) { downloadCancelled = true; badge('正在取消…（当前分片下完就停）'); return; }
+    format = format === 'ts' ? 'ts' : 'mp4';
     downloadBusy = true;
     downloadCancelled = false;
     let writable = null;
 
     try {
+      // ⓪ mp4 先确认重封装器在。@require 生效时这一步是零成本的；只有它没生效才会
+      //    真的走网络——那种情况下用户手势基本也保不住，会自然退到内存模式，可接受。
+      if (format === 'mp4' && !(await ensureMuxjs())) {
+        badge('重封装器不可用，改用 TS 原始格式');
+        format = 'ts';
+      }
+      const fi = FORMAT_INFO[format];
+
       // ① 文件句柄必须最先要：showSaveFilePicker 依赖"用户手势"，
       //    任何 await 之后手势就过期了，那时再调会直接抛 NotAllowedError。
       const wantStream = typeof window.showSaveFilePicker === 'function';
       if (wantStream) {
         try {
-          const handle = await window.showSaveFilePicker({ suggestedName: `${quickTitle()}.ts` });
+          const handle = await window.showSaveFilePicker({ suggestedName: `${quickTitle()}.${fi.ext}` });
           writable = await handle.createWritable();
         } catch (e) {
           if (e && e.name === 'AbortError') { badge('已取消'); return; }
@@ -724,8 +770,13 @@
       if (!pl.segments.length) { badge('播放列表里没有分片'); return; }
       if (pl.hasByteRange) { badge('这个列表用了 EXT-X-BYTERANGE，本版本下载器还没支持'); return; }
 
+      // 播放列表本身就是 fMP4(EXT-X-MAP) 时，分片已经是 mp4 容器，不必再重封装
+      const eff = pl.map ? FORMAT_INFO.mp4 : fi;
+      const transmux = format === 'mp4' && !pl.map;
+
       const total = pl.segments.length;
-      LOG(`下载目标：${isFull ? '完整版' : '试看'} · ${total} 段 · ${pl.duration.toFixed(1)}s · ${pl.map ? 'fMP4' : 'MPEG-TS'}`);
+      LOG(`下载目标：${isFull ? '完整版' : '试看'} · ${total} 段 · ${pl.duration.toFixed(1)}s`
+        + ` · ${pl.map ? 'fMP4' : 'MPEG-TS'} · 输出 ${eff.label}${transmux ? '(重封装)' : ''}`);
 
       // ③ 密钥 + 首段验证（首段顺带拿到，后面不重复下）
       let cryptoKey = null, cachedFirst = null;
@@ -748,7 +799,7 @@
       const parts = writable ? null : [];
       const write = writable ? (c) => writable.write(c) : async (c) => { parts.push(c); };
 
-      // fMP4 的初始化分片要在最前面（同样可能是加密的）
+      // 播放列表自带 fMP4 初始化分片时，它必须排在最前面（同样可能是加密的）
       if (pl.map) {
         const init = await fetchBytes(pl.map);
         const initPlain = cryptoKey
@@ -758,7 +809,21 @@
         await write(initPlain);
       }
 
-      // ④ 并发抓、按序落盘
+      // 重封装器：顺序喂 TS，它按顺序吐 fMP4 分片。
+      // 吐出来的东西**立刻落盘**，所以内存不会因为视频变长而累积。
+      let tm = null;
+      const muxQueue = [];
+      if (transmux) {
+        tm = new window.muxjs.mp4.Transmuxer({ remux: true });
+        tm.on('data', (seg) => {
+          if (seg.initSegment && seg.initSegment.byteLength) muxQueue.push(seg.initSegment);
+          if (seg.data && seg.data.byteLength) muxQueue.push(new Uint8Array(seg.data));
+        });
+        tm.on('error', (e) => WARN('重封装错误', e));
+      }
+      const drainMux = async () => { while (muxQueue.length) await write(muxQueue.shift()); };
+
+      // ④ 并发抓、按序处理
       const ahead = Math.max(1, Math.min(CFG.downloadConcurrency | 0 || 6, 12));
       const pending = new Map();
       let fetched = 0, written = 0;
@@ -775,27 +840,35 @@
         if (downloadCancelled) throw new Error('已取消');
         const chunk = await pending.get(written);
         pending.delete(written);
-        await write(chunk);
+        if (tm) { tm.push(chunk); await drainMux(); } else { await write(chunk); }
         written++;
         prime();
         if (written === total || written % 5 === 0) {
-          badge(`下载中 ${written}/${total} · ${Math.round((written / total) * 100)}%`);
+          badge(`${transmux ? '重封装' : '下载'}中 ${written}/${total} · ${Math.round((written / total) * 100)}%`);
         }
       }
 
+      // 收尾：flush 会把缓冲里的最后一段吐出来，给它一点时间落地再排空
+      if (tm) {
+        tm.flush();
+        await new Promise((r) => setTimeout(r, 150));
+        await drainMux();
+      }
+
+      const nice = `${quickTitle()}_${isFull ? '完整版' : '试看'}`;
       if (writable) {
         await writable.close();
         writable = null;
-        badge(`已保存 · ${total} 段 · ${pl.duration.toFixed(1)}s${isFull ? ' · 完整版' : ' · 试看'}`);
+        badge(`已保存(${eff.label}) · ${total} 段 · ${pl.duration.toFixed(1)}s${isFull ? ' · 完整版' : ' · 试看'}`);
       } else {
-        const blob = new Blob(parts, { type: pl.map ? 'video/mp4' : 'video/mp2t' });
+        const blob = new Blob(parts, { type: eff.mime });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
-        a.download = `${quickTitle()}_${isFull ? '完整版' : '试看'}.${pl.map ? 'mp4' : 'ts'}`;
+        a.download = `${nice}.${eff.ext}`;
         document.body.appendChild(a);
         a.click();
         setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 120000);
-        badge(`已下载 ${(blob.size / 1048576).toFixed(1)} MB · ${total} 段${isFull ? ' · 完整版' : ' · 试看'}`);
+        badge(`已下载 ${(blob.size / 1048576).toFixed(1)} MB(${eff.label}) · ${total} 段${isFull ? ' · 完整版' : ' · 试看'}`);
       }
     } catch (e) {
       if (writable) { try { await writable.abort(); } catch (x) {} }
@@ -814,7 +887,7 @@
     setupNotices();
     hookHls();
     floatingActions();
-    LOG('已加载 · 油猴脚本 v1.1.0');
+    LOG('已加载 · 油猴脚本 v1.2.0');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
