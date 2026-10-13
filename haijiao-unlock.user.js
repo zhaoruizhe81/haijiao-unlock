@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         海角社区 · 付费视频解锁(CDN完整播放列表) + 去广告
 // @namespace    local.haijiao.unlock
-// @version      1.0.2
-// @description  用 CDN 上同目录的完整 m3u8 替换试看 m3u8（API 只下发 30 秒试看列表，完整列表未鉴权）；顺手清掉广告位。不改 cookie、不改 DOM 付费状态、不发任何第三方请求。
+// @version      1.1.0
+// @description  用 CDN 上同目录的完整 m3u8 替换试看 m3u8（API 只下发 30 秒试看列表，完整列表未鉴权）；一键下载并解密成可离线播放的视频；顺手清掉广告位。不改 cookie、不改 DOM 付费状态、不发任何第三方请求。
 // @author       zhaoruizhe81
 // @homepageURL  https://github.com/zhaoruizhe81/haijiao-unlock
 // @supportURL   https://github.com/zhaoruizhe81/haijiao-unlock/issues
@@ -43,6 +43,8 @@
     killNotices: true,       // 关掉站点的"落地页弹窗"（防劫持/18+/收藏域名 三个公告）
     blockAdRequests: false,  // 直接掐掉 banner_list 请求（更干净，但某些皮肤会留空盒子）
     showButtons: true,       // 显示"完整版已接管"角标 + 复制链接 / 本页播放按钮
+    download: true,          // 显示"下载视频"按钮
+    downloadConcurrency: 6,  // 下载并发分片数（有序落盘，内存占用与视频长度无关）
     debug: true,
     maxSegments: 0           // >0 只保留前 N 段（调试用）
   };
@@ -403,6 +405,7 @@
         playFullHere(hit.url);
       })
     );
+    if (CFG.download) box.append(mk('⬇ 下载视频', downloadVideo));
     (document.body || document.documentElement).appendChild(box);
   }
 
@@ -499,6 +502,311 @@
     badge('独立播放器已启动');
   }
 
+  /* ---------------------------------------------------------------- 视频下载 */
+
+  /*
+   * 下载链路（实测通过：解的明文连续 4 个 0x47，即 MPEG-TS 的 188 字节同步字）：
+   *
+   *   播放列表 → 分片列表 + #EXT-X-KEY(METHOD=AES-128, URI=enc_<流>.key, IV=0x…)
+   *      ↓
+   *   密钥不是直给的：站点把 16 字节原始密钥再经自己的 wasm 过一遍 ——
+   *   jquery_key(keyBytes, <列表>.jpg 的字节)，输出的才是真 AES key。
+   *      ↓
+   *   每个分片 = AES-128-CBC + PKCS#7，用 WebCrypto 解（它自带去填充，明文正好短 4 字节）
+   *      ↓
+   *   并发抓、**按序落盘** → 内存占用只跟并发数有关，跟视频多长无关
+   *
+   * 两个刻意的设计：
+   *   1. 拿完密钥先拿"首段能不能解出 0x47"验证一遍，验不过就换下一个混淆文件、
+   *      全验不过就直接报错 —— 宁可不下载，也不产出一个看着像视频的坏文件。
+   *   2. 一开始就要文件句柄。showSaveFilePicker 需要"用户手势"，而任何 await
+   *      之后手势就过期了，所以必须放在最前面问。
+   */
+
+  /** 把播放列表文本解析成下载所需的一切。只认本站实际用到的标签子集。 */
+  function parsePlaylist(text, playlistUrl) {
+    const out = {
+      segments: [], key: null, map: null, duration: 0,
+      mediaSequence: 0, hasByteRange: false,
+    };
+    let pendingDuration = 0;
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (line === '') continue;
+      if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+        out.mediaSequence = Number.parseInt(line.slice(21), 10) || 0;
+      } else if (line.startsWith('#EXT-X-KEY:')) {
+        const method = /METHOD=([^,]+)/.exec(line);
+        const uri = /URI="([^"]+)"/.exec(line);
+        const iv = /IV=0x([0-9a-fA-F]+)/.exec(line);
+        out.key = method && method[1] !== 'NONE'
+          ? { method: method[1], url: uri ? new URL(uri[1], playlistUrl).href : null, iv: iv ? iv[1] : null }
+          : null;
+      } else if (line.startsWith('#EXT-X-MAP:')) {
+        const uri = /URI="([^"]+)"/.exec(line);
+        if (uri) out.map = new URL(uri[1], playlistUrl).href;
+      } else if (line.startsWith('#EXT-X-BYTERANGE:')) {
+        out.hasByteRange = true;
+      } else if (line.startsWith('#EXTINF:')) {
+        pendingDuration = Number.parseFloat(line.slice(8)) || 0;
+      } else if (!line.startsWith('#')) {
+        out.segments.push({
+          url: new URL(line, playlistUrl).href,
+          seq: out.mediaSequence + out.segments.length,
+        });
+        out.duration += pendingDuration;
+        pendingDuration = 0;
+      }
+    }
+    return out;
+  }
+
+  /** 没有显式 IV 时按 RFC 8216：用分片序号做 16 字节大端 IV。 */
+  function ivForSegment(pl, seg) {
+    if (pl.key && pl.key.iv) {
+      return new Uint8Array((pl.key.iv.match(/../g) || []).map((h) => Number.parseInt(h, 16)));
+    }
+    const iv = new Uint8Array(16);
+    let n = seg.seq >>> 0;
+    for (let i = 15; i >= 0 && n > 0; i--) { iv[i] = n & 0xff; n >>>= 8; }
+    return iv;
+  }
+
+  async function fetchBytes(url) {
+    const r = await fetch(url, { cache: 'no-store', credentials: 'omit' });
+    if (!r.ok) throw new Error(`HTTP ${r.status} · ${url.slice(-48)}`);
+    return new Uint8Array(await r.arrayBuffer());
+  }
+
+  // wasm 模块建一次就够，别每段都重建
+  let wasmModule = null;
+  async function getWasm() {
+    if (!wasmModule) {
+      if (typeof window.createModule !== 'function') throw new Error('站点的 wasm 模块未加载');
+      wasmModule = await window.createModule();
+    }
+    return wasmModule;
+  }
+
+  /** 复刻站点的密钥变换：jquery_key(keyBytes, 混淆文件字节) 就地改密钥。 */
+  async function transformKey(raw, disguise) {
+    const wasm = await getWasm();
+    const pk = wasm._malloc(raw.length);
+    const pj = wasm._malloc(disguise.length);
+    try {
+      wasm.HEAPU8.set(raw, pk);
+      wasm.HEAPU8.set(disguise, pj);
+      wasm.ccall('jquery_key', null, ['number', 'number', 'number', 'number'],
+        [pk, raw.length, pj, disguise.length]);
+      return new Uint8Array(wasm.HEAPU8.buffer, pk, raw.length).slice();
+    } finally {
+      wasm._free(pk);
+      wasm._free(pj);
+    }
+  }
+
+  /**
+   * 解出真正能用的 AES 密钥，并用首段做验证。
+   *
+   * 混淆文件按顺序试：完整列表自己那份 → 试看那份（同一条母流，密钥材料相同）。
+   * 每份都拿首段解一次，明文必须是 188 字节对齐的 MPEG-TS（连续 0x47）。
+   * 全部试完还不行就抛错 —— 不返回一个"看起来对"的密钥。
+   *
+   * 用 nativeFetch 而不是被脚本改写过的 fetch：blobRemap 会把完整版那份
+   * 重定向到试看那份，那样两个候选就变成同一个地址，验证就没意义了。
+   */
+  async function resolveDecryptKey(pl, fullUrl, previewUrl) {
+    if (!pl.key || !pl.key.url) return { cryptoKey: null, probe: null };
+    if (pl.key.method !== 'AES-128') throw new Error(`暂不支持的加密方式：${pl.key.method}`);
+
+    let kversion = '';
+    try { kversion = JSON.parse(sessionStorage.getItem('config') || '{}').kversion || ''; } catch (e) {}
+    const rawCandidates = kversion
+      ? [pl.key.url.replace('.key', '.keyv' + kversion), pl.key.url]
+      : [pl.key.url];
+    let raw = null;
+    for (const u of rawCandidates) {
+      try { raw = await fetchBytes(u); if (raw && raw.length) break; } catch (e) { WARN('密钥获取失败', u.slice(-40), e); }
+    }
+    if (!raw || raw.length < 16) throw new Error('密钥文件拿不到或长度不足');
+    raw = raw.slice(0, 16);
+
+    const seen = new Set();
+    const disguiseUrls = [fullUrl, previewUrl]
+      .filter(Boolean)
+      .map((u) => u.replace(/\.m3u8.*$/, '.jpg'))
+      .filter((u) => !seen.has(u) && seen.add(u));
+
+    const probeSeg = pl.segments[0];
+    const probeCipher = await fetchBytes(probeSeg.url);
+
+    for (const du of disguiseUrls) {
+      let disguise;
+      try {
+        const txt = await (await nativeFetch.call(window, du, { cache: 'no-store', credentials: 'omit' })).text();
+        disguise = Uint8Array.from(atob(txt.trim()), (c) => c.charCodeAt(0));
+      } catch (e) { WARN('混淆文件不可用', du.slice(-40)); continue; }
+
+      let real;
+      try { real = await transformKey(raw, disguise); } catch (e) { WARN('密钥变换失败', e); continue; }
+
+      const cryptoKey = await crypto.subtle.importKey('raw', real, { name: 'AES-CBC' }, false, ['decrypt']);
+      try {
+        const plain = new Uint8Array(await crypto.subtle.decrypt(
+          { name: 'AES-CBC', iv: ivForSegment(pl, probeSeg) }, cryptoKey, probeCipher));
+        if (plain[0] === 0x47 && plain[188] === 0x47) {
+          LOG('密钥验证通过 · 混淆文件:', du.split('/').pop());
+          return { cryptoKey, probe: { url: probeSeg.url, plain } };
+        }
+        WARN('该混淆文件解出的密钥解不开首段（同步字不对）:', du.split('/').pop());
+      } catch (e) {
+        WARN('该混淆文件解出的密钥解密抛错:', du.split('/').pop(), e.message);
+      }
+    }
+    throw new Error('密钥对不上：候选混淆文件都解不出有效的 MPEG-TS 头部');
+  }
+
+  function sanitizeName(text, fallback) {
+    const t = String(text || '')
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 80);
+    return t || fallback;
+  }
+
+  /** 同步取一个像标题的东西（要赶在 showSaveFilePicker 之前，不能 await）。 */
+  function quickTitle() {
+    const cands = ['h1', '.post-title', '.title', '[class*="title"]'];
+    for (const sel of cands) {
+      const el = document.querySelector(sel);
+      const t = el && sanitizeName(el.textContent, '');
+      if (t && t.length > 2 && !/^海角社区$/.test(t)) return t;
+    }
+    return 'haijiao';
+  }
+
+  let downloadBusy = false;
+  let downloadCancelled = false;
+
+  async function downloadVideo() {
+    if (downloadBusy) { downloadCancelled = true; badge('正在取消…（当前分片下完就停）'); return; }
+    downloadBusy = true;
+    downloadCancelled = false;
+    let writable = null;
+
+    try {
+      // ① 文件句柄必须最先要：showSaveFilePicker 依赖"用户手势"，
+      //    任何 await 之后手势就过期了，那时再调会直接抛 NotAllowedError。
+      const wantStream = typeof window.showSaveFilePicker === 'function';
+      if (wantStream) {
+        try {
+          const handle = await window.showSaveFilePicker({ suggestedName: `${quickTitle()}.ts` });
+          writable = await handle.createWritable();
+        } catch (e) {
+          if (e && e.name === 'AbortError') { badge('已取消'); return; }
+          WARN('流式落盘不可用，退回内存模式（大文件可能吃内存）', e);
+          writable = null;
+        }
+      }
+
+      // ② 定位播放列表
+      badge('解析播放列表…');
+      const lists = await collectPreviewUrls();
+      if (!lists.length) { badge('没找到试看列表地址'); return; }
+      const previewUrl = lists[0];
+      const hit = await resolveFullPlaylist(previewUrl);
+      const targetUrl = (hit && hit.url) || previewUrl;
+      const isFull = !!(hit && hit.url);
+
+      const text = await (await fetch(targetUrl, { cache: 'no-store' })).text();
+      const pl = parsePlaylist(text, targetUrl);
+      if (!pl.segments.length) { badge('播放列表里没有分片'); return; }
+      if (pl.hasByteRange) { badge('这个列表用了 EXT-X-BYTERANGE，本版本下载器还没支持'); return; }
+
+      const total = pl.segments.length;
+      LOG(`下载目标：${isFull ? '完整版' : '试看'} · ${total} 段 · ${pl.duration.toFixed(1)}s · ${pl.map ? 'fMP4' : 'MPEG-TS'}`);
+
+      // ③ 密钥 + 首段验证（首段顺带拿到，后面不重复下）
+      let cryptoKey = null, cachedFirst = null;
+      if (pl.key) {
+        badge('解密钥 + 验证首段…');
+        const dec = await resolveDecryptKey(pl, targetUrl, previewUrl);
+        cryptoKey = dec.cryptoKey;
+        cachedFirst = dec.probe && dec.probe.plain;
+      }
+
+      const grab = async (i) => {
+        if (i === 0 && cachedFirst) return cachedFirst;
+        const seg = pl.segments[i];
+        const buf = await fetchBytes(seg.url);
+        if (!cryptoKey) return buf;
+        return new Uint8Array(await crypto.subtle.decrypt(
+          { name: 'AES-CBC', iv: ivForSegment(pl, seg) }, cryptoKey, buf));
+      };
+
+      const parts = writable ? null : [];
+      const write = writable ? (c) => writable.write(c) : async (c) => { parts.push(c); };
+
+      // fMP4 的初始化分片要在最前面（同样可能是加密的）
+      if (pl.map) {
+        const init = await fetchBytes(pl.map);
+        const initPlain = cryptoKey
+          ? new Uint8Array(await crypto.subtle.decrypt(
+            { name: 'AES-CBC', iv: ivForSegment(pl, { seq: pl.mediaSequence }) }, cryptoKey, init))
+          : init;
+        await write(initPlain);
+      }
+
+      // ④ 并发抓、按序落盘
+      const ahead = Math.max(1, Math.min(CFG.downloadConcurrency | 0 || 6, 12));
+      const pending = new Map();
+      let fetched = 0, written = 0;
+
+      const prime = () => {
+        while (fetched < total && pending.size < ahead) {
+          pending.set(fetched, grab(fetched));
+          fetched++;
+        }
+      };
+      prime();
+
+      while (written < total) {
+        if (downloadCancelled) throw new Error('已取消');
+        const chunk = await pending.get(written);
+        pending.delete(written);
+        await write(chunk);
+        written++;
+        prime();
+        if (written === total || written % 5 === 0) {
+          badge(`下载中 ${written}/${total} · ${Math.round((written / total) * 100)}%`);
+        }
+      }
+
+      if (writable) {
+        await writable.close();
+        writable = null;
+        badge(`已保存 · ${total} 段 · ${pl.duration.toFixed(1)}s${isFull ? ' · 完整版' : ' · 试看'}`);
+      } else {
+        const blob = new Blob(parts, { type: pl.map ? 'video/mp4' : 'video/mp2t' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `${quickTitle()}_${isFull ? '完整版' : '试看'}.${pl.map ? 'mp4' : 'ts'}`;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 120000);
+        badge(`已下载 ${(blob.size / 1048576).toFixed(1)} MB · ${total} 段${isFull ? ' · 完整版' : ' · 试看'}`);
+      }
+    } catch (e) {
+      if (writable) { try { await writable.abort(); } catch (x) {} }
+      badge('下载失败: ' + (e && e.message ? e.message : String(e)));
+      WARN('下载失败', e);
+    } finally {
+      downloadBusy = false;
+      downloadCancelled = false;
+    }
+  }
+
   /* ---------------------------------------------------------------- 启动流程 */
 
   function boot() {
@@ -506,7 +814,7 @@
     setupNotices();
     hookHls();
     floatingActions();
-    LOG('已加载 · 油猴脚本 v1.0.1');
+    LOG('已加载 · 油猴脚本 v1.1.0');
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
